@@ -75,3 +75,4 @@ export interface MiniTaskUpdate {
   has_break?: boolean;
   break_duration_minutes?: number;
 }
+

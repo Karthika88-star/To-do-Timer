@@ -13,7 +13,7 @@ function HeaderContent() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const view = searchParams.get('view');
-  const { toggleTheme, isDark } = useTheme();
+  const { toggleTheme, isDark, mounted } = useTheme();
 
   // If in distraction-free focus screen, keep header minimal/invisible
   const isFocusScreen = pathname.includes('/focus');
@@ -45,9 +45,9 @@ function HeaderContent() {
         <button
           onClick={toggleTheme}
           className="p-2 rounded-lg bg-[var(--surface-card,#11211F)] border border-[var(--border-color,#243A34)] text-[var(--text-secondary,#A5B5AD)] hover:text-[var(--text-primary,#F2F6F1)]"
-          aria-label={isDark ? 'Switch to warm light theme' : 'Switch to Dark Focus Studio'}
+          aria-label={mounted && !isDark ? 'Switch to Dark Focus Studio' : 'Switch to warm light theme'}
         >
-          {isDark ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-emerald-800" />}
+          {mounted && !isDark ? <Moon className="w-4 h-4 text-emerald-800" /> : <Sun className="w-4 h-4 text-amber-400" />}
         </button>
 
         <button

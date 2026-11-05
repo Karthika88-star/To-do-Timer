@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, Suspense } from 'react';
+import React, { useState, useEffect, useCallback, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useAuth } from '@/lib/authContext';
 import { 
@@ -42,15 +42,14 @@ function DashboardContent() {
       ? 'completed'
       : 'dashboard';
 
-  const userId = user?.id;
-  const [prevUserId, setPrevUserId] = useState<string | null>(userId || null);
+  const currentUserId = user?.id ?? null;
+  const userId = currentUserId || undefined;
+  const [prevUserId, setPrevUserId] = useState<string | null>(currentUserId);
   const [tasks, setTasks] = useState<MajorTask[]>([]);
-  const [isLoadingTasks, setIsLoadingTasks] = useState<boolean>(Boolean(userId));
 
-  if (userId !== prevUserId) {
-    setPrevUserId(userId || null);
+  if (currentUserId !== prevUserId) {
+    setPrevUserId(currentUserId);
     setTasks([]);
-    setIsLoadingTasks(Boolean(userId));
   }
 
   const [dashboardFilter, setDashboardFilter] = useState<'all' | 'not_started' | 'in_progress' | 'completed'>('all');
@@ -59,44 +58,33 @@ function DashboardContent() {
   const [taskToDelete, setTaskToDelete] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  const reloadTasks = async () => {
-    if (userId) {
-      const fresh = await taskService.getTasks(userId);
+  const reloadTasks = useCallback(async () => {
+    if (currentUserId) {
+      const fresh = await taskService.getTasks(currentUserId);
       setTasks(fresh);
     } else {
       setTasks([]);
     }
-  };
+  }, [currentUserId]);
 
   // Immediate reactive synchronization across tabs, routes, and focus sessions
   useEffect(() => {
     let isMounted = true;
 
-    if (!userId) {
-      setTasks([]);
-      setIsLoadingTasks(false);
-      return;
-    }
+    if (!currentUserId) return;
 
-    const loadInitialTasks = async () => {
-      try {
-        const fresh = await taskService.getTasks(userId);
-        if (isMounted) {
-          setTasks(fresh);
-          setIsLoadingTasks(false);
-        }
-      } catch (err) {
+    taskService.getTasks(currentUserId)
+      .then(fresh => {
+        if (isMounted) setTasks(fresh);
+      })
+      .catch(err => {
         console.error('Error loading tasks:', err);
-        if (isMounted) setIsLoadingTasks(false);
-      }
-    };
-
-    loadInitialTasks();
+      });
 
     const handleSync = async () => {
-      if (!userId) return;
+      if (!currentUserId) return;
       try {
-        const fresh = await taskService.getTasks(userId);
+        const fresh = await taskService.getTasks(currentUserId);
         if (isMounted) {
           setTasks(fresh);
         }
@@ -114,7 +102,7 @@ function DashboardContent() {
       window.removeEventListener('storage', handleSync);
       window.removeEventListener('focus', handleSync);
     };
-  }, [userId]);
+  }, [currentUserId]);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);

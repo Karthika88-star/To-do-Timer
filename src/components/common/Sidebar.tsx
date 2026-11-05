@@ -24,7 +24,7 @@ function SidebarNav({ taskCount = 0, completedCount = 0 }: SidebarProps) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const view = searchParams.get('view');
-  const { toggleTheme, isDark } = useTheme();
+  const { toggleTheme, isDark, mounted } = useTheme();
 
   const isDashboardActive = pathname === '/dashboard' && (!view || view === 'dashboard');
   const isMyTasksActive = (pathname === '/dashboard' && view === 'my-tasks') || (pathname.startsWith('/tasks') && !pathname.includes('/focus'));
@@ -90,10 +90,10 @@ function SidebarNav({ taskCount = 0, completedCount = 0 }: SidebarProps) {
           <button
             onClick={toggleTheme}
             className="p-2 rounded-xl bg-[var(--surface-card,#11211F)] border border-[var(--border-color,#243A34)] text-[var(--text-secondary,#A5B5AD)] hover:text-[var(--text-primary,#F2F6F1)] hover:border-[var(--primary-accent,#5ACB91)]/40 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary-accent,#5ACB91)]"
-            aria-label={isDark ? 'Switch to warm light theme' : 'Switch to Dark Focus Studio theme'}
-            title={isDark ? 'Switch to Warm Light theme' : 'Switch to Dark Focus Studio'}
+            aria-label={mounted && !isDark ? 'Switch to Dark Focus Studio theme' : 'Switch to warm light theme'}
+            title={mounted && !isDark ? 'Switch to Dark Focus Studio' : 'Switch to Warm Light theme'}
           >
-            {isDark ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-emerald-800" />}
+            {mounted && !isDark ? <Moon className="w-4 h-4 text-emerald-800" /> : <Sun className="w-4 h-4 text-amber-400" />}
           </button>
         </div>
 

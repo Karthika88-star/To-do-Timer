@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, Suspense } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import { 
@@ -32,6 +32,7 @@ import {
   RotateCcw
 } from 'lucide-react';
 import { MajorTask, MiniTask } from '@/types';
+import { storage } from '@/lib/storage';
 import { taskService } from '@/lib/services/taskService';
 import { useAuth } from '@/lib/authContext';
 import { Sidebar } from '@/components/common/Sidebar';
@@ -47,10 +48,12 @@ function TaskDetailContent() {
   const params = useParams();
   const id = (params?.id as string) || '';
   const { user } = useAuth();
-  const userId = user?.id;
+  const currentUserId = user?.id ?? null;
+  const userId = currentUserId || undefined;
+  const currentId = id || '';
 
-  const [prevId, setPrevId] = useState<string>(id);
-  const [prevUserId, setPrevUserId] = useState<string | null>(userId || null);
+  const [prevId, setPrevId] = useState<string>(currentId);
+  const [prevUserId, setPrevUserId] = useState<string | null>(currentUserId);
   const [task, setTask] = useState<MajorTask | null>(null);
   const [isLoadingTask, setIsLoadingTask] = useState<boolean>(true);
 
@@ -60,9 +63,9 @@ function TaskDetailContent() {
   const [editDescription, setEditDescription] = useState('');
 
   // Adjust state during render when id or userId changes
-  if (id !== prevId || userId !== prevUserId) {
-    setPrevId(id);
-    setPrevUserId(userId || null);
+  if (currentId !== prevId || currentUserId !== prevUserId) {
+    setPrevId(currentId);
+    setPrevUserId(currentUserId);
     setTask(null);
     setIsLoadingTask(true);
   }
@@ -85,29 +88,23 @@ function TaskDetailContent() {
 
   useEffect(() => {
     let isMounted = true;
-    if (!id || !userId) {
-      setIsLoadingTask(false);
-      return;
-    }
+    if (!id || !userId) return;
 
-    const loadTask = async () => {
-      try {
-        const loaded = await taskService.getTaskById(id, userId);
+    taskService.getTaskById(id, userId)
+      .then(loaded => {
         if (isMounted) {
           setTask(loaded);
           setEditTitle(loaded?.title || '');
           setEditDescription(loaded?.description || '');
           setIsLoadingTask(false);
         }
-      } catch (err) {
+      })
+      .catch(err => {
         console.error('Error loading task:', err);
         if (isMounted) {
           setIsLoadingTask(false);
         }
-      }
-    };
-
-    loadTask();
+      });
 
     const handleSync = async () => {
       if (!id || !userId) return;
@@ -591,8 +588,17 @@ function TaskDetailContent() {
         isOpen={showCompletionModal}
         majorTaskId={task.id}
         majorTaskTitle={task.title}
-        completedCount={miniTasks.length}
-        totalFocusedMinutes={totalPlannedMinutes}
+        completedCount={miniTasks.filter(m => m.isCompleted).length || miniTasks.length}
+        totalFocusedMinutes={(() => {
+          const session = storage.getTimerSession(task.id, userId);
+          if (session && typeof session.totalFocusedSeconds === 'number' && session.totalFocusedSeconds > 0) {
+            return Math.max(1, Math.round(session.totalFocusedSeconds / 60));
+          }
+          const actualDoneMinutes = miniTasks
+            .filter(m => m.isCompleted)
+            .reduce((acc, m) => acc + m.durationMinutes + (m.extraTimeMinutes || 0), 0);
+          return actualDoneMinutes > 0 ? actualDoneMinutes : totalPlannedMinutes;
+        })()}
         userId={user?.id}
         onRestart={async () => {
           if (!userId) return;

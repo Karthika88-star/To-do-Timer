@@ -1,8 +1,9 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { MajorTask, MiniTask, TimerPhase } from '@/types';
+import { MajorTask, MiniTask, TimerPhase, TimerSession } from '@/types';
 import { storage } from '@/lib/storage';
+import { taskService } from '@/lib/services/taskService';
 import { sound } from '@/lib/audio';
 
 interface UseTimerOptions {
@@ -24,7 +25,8 @@ export function useTimer({
   const initialTarget = majorTask?.miniTasks?.find(m => !m.isCompleted) || majorTask?.miniTasks?.[0] || null;
   const initialSeconds = initialTarget ? initialTarget.durationMinutes * 60 : 0;
 
-  const [prevTaskId, setPrevTaskId] = useState<string | null>(majorTask?.id || null);
+  const currentTaskId = majorTask?.id ?? null;
+  const [prevTaskId, setPrevTaskId] = useState<string | null>(currentTaskId);
   const [phase, setPhase] = useState<TimerPhase>(() => {
     if (!majorTask?.miniTasks?.length) return 'idle';
     return initialTarget && !initialTarget.isCompleted ? 'paused' : 'completed';
@@ -36,10 +38,33 @@ export function useTimer({
   const [sessionFocusedSeconds, setSessionFocusedSeconds] = useState<number>(0);
   const [sessionCompletedIds, setSessionCompletedIds] = useState<string[]>([]);
 
+  const targetEndTimeRef = useRef<number | null>(null);
+  const isTransitioningRef = useRef<boolean>(false);
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const workStartTimeRef = useRef<number | null>(null);
+  const accumulatedFocusedSecondsRef = useRef<number>(0);
+  const completedIdsRef = useRef<Set<string>>(new Set());
+
+  // Restore saved timer session on mount or task change
+  useEffect(() => {
+    if (!majorTask?.id || !userId) return;
+    const saved = storage.getTimerSession(majorTask.id, userId);
+    if (saved) {
+      if (saved.completedMiniTaskIds && saved.completedMiniTaskIds.length > 0) {
+        saved.completedMiniTaskIds.forEach(id => completedIdsRef.current.add(id));
+        setSessionCompletedIds(Array.from(completedIdsRef.current));
+      }
+      if (typeof saved.totalFocusedSeconds === 'number') {
+        accumulatedFocusedSecondsRef.current = saved.totalFocusedSeconds;
+        setSessionFocusedSeconds(saved.totalFocusedSeconds);
+      }
+    }
+  }, [majorTask?.id, userId]);
+
   // Adjust state during render when majorTask ID changes (React 19 recommended pattern)
-  if (majorTask && majorTask.id !== prevTaskId) {
-    setPrevTaskId(majorTask.id);
-    const target = majorTask.miniTasks.find(m => !m.isCompleted) || majorTask.miniTasks[0] || null;
+  if (currentTaskId !== prevTaskId) {
+    setPrevTaskId(currentTaskId);
+    const target = majorTask?.miniTasks.find(m => !m.isCompleted) || majorTask?.miniTasks[0] || null;
     setCurrentMiniTask(target);
     const secs = target ? target.durationMinutes * 60 : 0;
     setRemainingSeconds(secs);
@@ -48,25 +73,81 @@ export function useTimer({
     setPhase(target && !target.isCompleted ? 'paused' : 'completed');
   }
 
-  const targetEndTimeRef = useRef<number | null>(null);
-  const isTransitioningRef = useRef<boolean>(false);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
-
   // Helper: Is this the last unfinished mini-task?
   const allMini = majorTask?.miniTasks || [];
-  const incompleteRemaining = allMini.filter(m => !m.isCompleted && m.id !== currentMiniTask?.id);
+  const incompleteRemaining = allMini.filter(
+    m => !m.isCompleted && m.id !== currentMiniTask?.id && !sessionCompletedIds.includes(m.id)
+  );
   const isFinalTask = incompleteRemaining.length === 0;
+
+  // Flush in-flight active focused seconds into accumulated total
+  const flushWorkTime = useCallback(() => {
+    if (!isBreak && workStartTimeRef.current) {
+      const elapsed = Math.max(0, Math.round((Date.now() - workStartTimeRef.current) / 1000));
+      accumulatedFocusedSecondsRef.current += elapsed;
+      workStartTimeRef.current = null;
+      setSessionFocusedSeconds(accumulatedFocusedSecondsRef.current);
+    }
+  }, [isBreak]);
+
+  // Save current timer session state to storage for persistence across reloads
+  const saveSession = useCallback(
+    (newPhase: TimerPhase, remSecs: number, targetEnd: number | null) => {
+      if (!majorTask?.id || !userId) return;
+      const session: TimerSession = {
+        majorTaskId: majorTask.id,
+        currentMiniTaskId: currentMiniTask?.id || null,
+        phase: newPhase,
+        targetEndTime: targetEnd,
+        remainingSeconds: remSecs,
+        totalDurationSeconds,
+        isBreak,
+        completedMiniTaskIds: Array.from(completedIdsRef.current),
+        totalFocusedSeconds: accumulatedFocusedSecondsRef.current,
+        lastTickTimestamp: Date.now(),
+      };
+      storage.saveTimerSession(session, userId);
+    },
+    [majorTask, userId, currentMiniTask?.id, totalDurationSeconds, isBreak]
+  );
+
+  // Capture completion stats before resetting state or clearing timer session
+  const captureCompletionStats = useCallback(
+    (isFinal: boolean) => {
+      flushWorkTime();
+      const allM = majorTask?.miniTasks || [];
+      const completedSet = new Set([
+        ...Array.from(completedIdsRef.current),
+        ...(currentMiniTask ? [currentMiniTask.id] : []),
+        ...allM.filter(m => m.isCompleted).map(m => m.id),
+      ]);
+
+      const completedCount = isFinal
+        ? Math.max(completedSet.size, allM.length)
+        : completedSet.size;
+
+      const actualSecs = accumulatedFocusedSecondsRef.current;
+      // Calculate actual completed focus duration using timer-session data
+      // If actual focus time was recorded, round to minutes (at least 1 if >0)
+      const focusedMinutes = actualSecs > 0 ? Math.max(1, Math.round(actualSecs / 60)) : 0;
+
+      return { completedCount, focusedMinutes };
+    },
+    [flushWorkTime, majorTask?.miniTasks, currentMiniTask]
+  );
 
   // Work timer expiry handler: PAUSE at 00:00 and open decision dialog
   const handleWorkTimerExpired = useCallback(() => {
     targetEndTimeRef.current = null;
+    flushWorkTime();
     setRemainingSeconds(0);
     setPhase('decision');
+    saveSession('decision', 0, null);
 
     if (soundEnabled) {
       sound.playCompletionChime();
     }
-  }, [soundEnabled]);
+  }, [flushWorkTime, saveSession, soundEnabled]);
 
   // Break timer expiry handler: automatically advance after break
   const handleBreakTimerExpired = useCallback(() => {
@@ -85,9 +166,8 @@ export function useTimer({
       return;
     }
 
-    const freshTask = storage.getTaskById(majorTask.id, userId);
-    const taskList = freshTask?.miniTasks || majorTask.miniTasks;
-    const nextTask = taskList.find(m => !m.isCompleted);
+    const taskList = majorTask.miniTasks || [];
+    const nextTask = taskList.find(m => !m.isCompleted && !completedIdsRef.current.has(m.id));
 
     if (nextTask) {
       setCurrentMiniTask(nextTask);
@@ -95,19 +175,24 @@ export function useTimer({
       setTotalDurationSeconds(workSecs);
       setRemainingSeconds(workSecs);
       setPhase('paused');
+      saveSession('paused', workSecs, null);
     } else {
       // All done!
+      const stats = captureCompletionStats(true);
       setPhase('completed');
-      storage.completeMajorTask(majorTask.id, userId);
+      if (userId) {
+        if (stats.focusedMinutes > 0) {
+          storage.addFocusedMinutes(stats.focusedMinutes, userId);
+        }
+        taskService.completeMajorTask(majorTask.id, userId);
+      }
       if (onAllCompleted) {
-        const completedCount = taskList.filter(m => m.isCompleted).length;
-        const totalMinutes = taskList.reduce((acc, m) => acc + (m.isCompleted ? m.durationMinutes + (m.extraTimeMinutes || 0) : 0), 0);
-        onAllCompleted({ completedCount, focusedMinutes: totalMinutes });
+        onAllCompleted(stats);
       }
     }
 
     isTransitioningRef.current = false;
-  }, [majorTask, soundEnabled, onAllCompleted, userId]);
+  }, [majorTask, soundEnabled, captureCompletionStats, saveSession, userId, onAllCompleted]);
 
   // Main countdown tick loop (drift-free timestamp calculation)
   useEffect(() => {
@@ -118,6 +203,12 @@ export function useTimer({
         const now = Date.now();
         const remaining = Math.max(0, Math.ceil((targetEndTimeRef.current - now) / 1000));
         setRemainingSeconds(remaining);
+
+        // Keep sessionFocusedSeconds reactive during active focus work
+        if (!isBreak && workStartTimeRef.current) {
+          const liveElapsed = Math.max(0, Math.round((now - workStartTimeRef.current) / 1000));
+          setSessionFocusedSeconds(accumulatedFocusedSecondsRef.current + liveElapsed);
+        }
 
         if (remaining <= 0) {
           if (intervalRef.current) clearInterval(intervalRef.current);
@@ -143,37 +234,47 @@ export function useTimer({
   }, [phase, isBreak, handleWorkTimerExpired, handleBreakTimerExpired]);
 
   // Action 1: Add Extra Time
-  const addExtraTime = useCallback((minutes: number) => {
-    if (minutes <= 0 || !majorTask || !currentMiniTask) return;
+  const addExtraTime = useCallback(
+    (minutes: number) => {
+      if (minutes <= 0 || !majorTask || !currentMiniTask) return;
 
-    const addedMinutes = Math.min(180, Math.max(1, minutes));
-    const previousExtra = currentMiniTask.extraTimeMinutes || 0;
-    const newExtra = previousExtra + addedMinutes;
+      const addedMinutes = Math.min(180, Math.max(1, minutes));
+      const previousExtra = currentMiniTask.extraTimeMinutes || 0;
+      const newExtra = previousExtra + addedMinutes;
 
-    // Persist to storage, preserving original planned duration separately
-    storage.updateMiniTask(majorTask.id, currentMiniTask.id, { extraTimeMinutes: newExtra }, userId);
+      // Persist to database/service, preserving original planned duration separately
+      if (userId) {
+        taskService.updateMiniTask(majorTask.id, currentMiniTask.id, { extraTimeMinutes: newExtra }, userId);
+      }
 
-    setCurrentMiniTask(prev => prev ? { ...prev, extraTimeMinutes: newExtra } : null);
+      setCurrentMiniTask(prev => (prev ? { ...prev, extraTimeMinutes: newExtra } : null));
 
-    const extraSeconds = addedMinutes * 60;
-    setRemainingSeconds(extraSeconds);
-    setTotalDurationSeconds(extraSeconds);
-    targetEndTimeRef.current = Date.now() + extraSeconds * 1000;
-    setPhase('running');
-  }, [majorTask, currentMiniTask, userId]);
+      const extraSeconds = addedMinutes * 60;
+      setRemainingSeconds(extraSeconds);
+      setTotalDurationSeconds(extraSeconds);
+      const targetEnd = Date.now() + extraSeconds * 1000;
+      targetEndTimeRef.current = targetEnd;
+      workStartTimeRef.current = Date.now();
+      setPhase('running');
+      saveSession('running', extraSeconds, targetEnd);
+    },
+    [majorTask, currentMiniTask, userId, saveSession]
+  );
 
   // Action 2: Move to Next Task (marks current completed, starts break if configured)
   const moveToNextTask = useCallback(() => {
     if (isTransitioningRef.current || !majorTask || !currentMiniTask) return;
     isTransitioningRef.current = true;
 
-    // 1. Mark current mini-task as completed in storage
-    storage.updateMiniTask(majorTask.id, currentMiniTask.id, { isCompleted: true }, userId);
-    const focusedMinutes = currentMiniTask.durationMinutes + (currentMiniTask.extraTimeMinutes || 0);
-    storage.addFocusedMinutes(focusedMinutes, userId);
+    flushWorkTime();
 
-    setSessionCompletedIds(prev => [...new Set([...prev, currentMiniTask.id])]);
-    setSessionFocusedSeconds(prev => prev + focusedMinutes * 60);
+    // 1. Mark current mini-task as completed in storage/database
+    completedIdsRef.current.add(currentMiniTask.id);
+    setSessionCompletedIds(Array.from(completedIdsRef.current));
+
+    if (userId) {
+      taskService.updateMiniTask(majorTask.id, currentMiniTask.id, { isCompleted: true }, userId);
+    }
 
     if (onMiniTaskCompleted) {
       onMiniTaskCompleted(currentMiniTask.id);
@@ -186,16 +287,19 @@ export function useTimer({
       setTotalDurationSeconds(breakSeconds);
       setRemainingSeconds(breakSeconds);
       setPhase('break');
-      targetEndTimeRef.current = Date.now() + breakSeconds * 1000;
+      const targetEnd = Date.now() + breakSeconds * 1000;
+      targetEndTimeRef.current = targetEnd;
+      saveSession('break', breakSeconds, targetEnd);
       isTransitioningRef.current = false;
       return;
     }
 
     // 3. Otherwise find next incomplete task
     setIsBreak(false);
-    const freshTask = storage.getTaskById(majorTask.id, userId);
-    const allMiniTasks = freshTask?.miniTasks || majorTask.miniTasks;
-    const nextTask = allMiniTasks.find(m => !m.isCompleted && m.id !== currentMiniTask.id);
+    const allMiniTasks = majorTask.miniTasks || [];
+    const nextTask = allMiniTasks.find(
+      m => !m.isCompleted && m.id !== currentMiniTask.id && !completedIdsRef.current.has(m.id)
+    );
 
     if (nextTask) {
       setCurrentMiniTask(nextTask);
@@ -204,49 +308,73 @@ export function useTimer({
       setRemainingSeconds(workSeconds);
       setPhase('paused');
       targetEndTimeRef.current = null;
+      saveSession('paused', workSeconds, null);
     } else {
-      // All mini-tasks are finished!
+      // All mini-tasks are finished! Capture stats FIRST before completing in database
+      const stats = captureCompletionStats(true);
       setPhase('completed');
       targetEndTimeRef.current = null;
-      storage.completeMajorTask(majorTask.id, userId);
+
+      if (userId) {
+        if (stats.focusedMinutes > 0) {
+          storage.addFocusedMinutes(stats.focusedMinutes, userId);
+        }
+        taskService.completeMajorTask(majorTask.id, userId);
+      }
+
       if (onAllCompleted) {
-        const completedCount = allMiniTasks.filter(m => m.isCompleted).length;
-        const totalMinutes = allMiniTasks.reduce((acc, m) => acc + (m.isCompleted ? m.durationMinutes + (m.extraTimeMinutes || 0) : 0), 0);
-        onAllCompleted({
-          completedCount,
-          focusedMinutes: totalMinutes,
-        });
+        onAllCompleted(stats);
       }
     }
 
     isTransitioningRef.current = false;
-  }, [majorTask, currentMiniTask, onMiniTaskCompleted, onAllCompleted, userId]);
+  }, [
+    majorTask,
+    currentMiniTask,
+    flushWorkTime,
+    userId,
+    onMiniTaskCompleted,
+    saveSession,
+    captureCompletionStats,
+    onAllCompleted,
+  ]);
 
   // Action 3: Finish Major Task (records completion timestamp and shows feedback)
   const finishMajorTask = useCallback(() => {
     if (!majorTask) return;
     targetEndTimeRef.current = null;
+    flushWorkTime();
 
-    if (currentMiniTask && !currentMiniTask.isCompleted) {
-      storage.updateMiniTask(majorTask.id, currentMiniTask.id, { isCompleted: true }, userId);
-      const focusedMinutes = currentMiniTask.durationMinutes + (currentMiniTask.extraTimeMinutes || 0);
-      storage.addFocusedMinutes(focusedMinutes, userId);
+    if (currentMiniTask && userId) {
+      completedIdsRef.current.add(currentMiniTask.id);
+      setSessionCompletedIds(Array.from(completedIdsRef.current));
+      taskService.updateMiniTask(majorTask.id, currentMiniTask.id, { isCompleted: true }, userId);
       if (onMiniTaskCompleted) onMiniTaskCompleted(currentMiniTask.id);
     }
 
-    const completed = storage.completeMajorTask(majorTask.id, userId);
+    // Capture stats FIRST before completing in database
+    const stats = captureCompletionStats(true);
     setPhase('completed');
 
-    if (onAllCompleted) {
-      const allM = completed?.miniTasks || majorTask.miniTasks;
-      const count = allM.filter(m => m.isCompleted).length;
-      const mins = allM.reduce((acc, m) => acc + (m.isCompleted ? m.durationMinutes + (m.extraTimeMinutes || 0) : 0), 0);
-      onAllCompleted({
-        completedCount: count,
-        focusedMinutes: mins,
-      });
+    if (userId) {
+      if (stats.focusedMinutes > 0) {
+        storage.addFocusedMinutes(stats.focusedMinutes, userId);
+      }
+      taskService.completeMajorTask(majorTask.id, userId);
     }
-  }, [majorTask, currentMiniTask, onMiniTaskCompleted, onAllCompleted, userId]);
+
+    if (onAllCompleted) {
+      onAllCompleted(stats);
+    }
+  }, [
+    majorTask,
+    currentMiniTask,
+    flushWorkTime,
+    userId,
+    onMiniTaskCompleted,
+    captureCompletionStats,
+    onAllCompleted,
+  ]);
 
   // Skip break directly to next task
   const skipBreak = useCallback(() => {
@@ -255,9 +383,10 @@ export function useTimer({
     targetEndTimeRef.current = null;
 
     if (!majorTask || !currentMiniTask) return;
-    const freshTask = storage.getTaskById(majorTask.id, userId);
-    const allMini = freshTask?.miniTasks || majorTask.miniTasks;
-    const nextTask = allMini.find(m => !m.isCompleted);
+    const allM = majorTask.miniTasks || [];
+    const nextTask = allM.find(
+      m => !m.isCompleted && m.id !== currentMiniTask.id && !completedIdsRef.current.has(m.id)
+    );
 
     if (nextTask) {
       setCurrentMiniTask(nextTask);
@@ -265,16 +394,21 @@ export function useTimer({
       setTotalDurationSeconds(workSeconds);
       setRemainingSeconds(workSeconds);
       setPhase('paused');
+      saveSession('paused', workSeconds, null);
     } else {
+      const stats = captureCompletionStats(true);
       setPhase('completed');
-      storage.completeMajorTask(majorTask.id, userId);
+      if (userId) {
+        if (stats.focusedMinutes > 0) {
+          storage.addFocusedMinutes(stats.focusedMinutes, userId);
+        }
+        taskService.completeMajorTask(majorTask.id, userId);
+      }
       if (onAllCompleted) {
-        const count = allMini.filter(m => m.isCompleted).length;
-        const totalMinutes = allMini.reduce((acc, m) => acc + (m.isCompleted ? m.durationMinutes + (m.extraTimeMinutes || 0) : 0), 0);
-        onAllCompleted({ completedCount: count, focusedMinutes: totalMinutes });
+        onAllCompleted(stats);
       }
     }
-  }, [isBreak, majorTask, currentMiniTask, onAllCompleted, userId]);
+  }, [isBreak, majorTask, currentMiniTask, saveSession, captureCompletionStats, userId, onAllCompleted]);
 
   // Manual complete current step (used by "Complete" button / Shift+C)
   const completeCurrentStep = useCallback(() => {
@@ -289,12 +423,18 @@ export function useTimer({
   // Start or resume
   const start = useCallback(() => {
     if (phase === 'completed') return;
-    targetEndTimeRef.current = Date.now() + remainingSeconds * 1000;
-    setPhase(isBreak ? 'break' : 'running');
-    if (majorTask?.id) {
-      storage.startMajorTask(majorTask.id, userId);
+    const targetEnd = Date.now() + remainingSeconds * 1000;
+    targetEndTimeRef.current = targetEnd;
+    if (!isBreak) {
+      workStartTimeRef.current = Date.now();
     }
-  }, [phase, remainingSeconds, isBreak, majorTask, userId]);
+    const newPhase: TimerPhase = isBreak ? 'break' : 'running';
+    setPhase(newPhase);
+    saveSession(newPhase, remainingSeconds, targetEnd);
+    if (majorTask?.id && userId) {
+      taskService.startMajorTask(majorTask.id, userId);
+    }
+  }, [phase, remainingSeconds, isBreak, saveSession, majorTask, userId]);
 
   // Pause
   const pause = useCallback(() => {
@@ -303,42 +443,52 @@ export function useTimer({
       setRemainingSeconds(remaining);
       targetEndTimeRef.current = null;
     }
+    flushWorkTime();
     setPhase('paused');
-    // Ensure task status remains persisted in progress
-    if (majorTask?.id) {
-      storage.startMajorTask(majorTask.id, userId);
+    saveSession('paused', remainingSeconds, null);
+    if (majorTask?.id && userId) {
+      taskService.startMajorTask(majorTask.id, userId);
     }
-  }, [majorTask, userId]);
+  }, [flushWorkTime, saveSession, remainingSeconds, majorTask, userId]);
 
   // Reset current step back to full duration
   const resetCurrentStep = useCallback(() => {
     targetEndTimeRef.current = null;
+    workStartTimeRef.current = null;
     if (isBreak && currentMiniTask) {
       const breakSeconds = currentMiniTask.breakDurationMinutes * 60;
       setRemainingSeconds(breakSeconds);
       setTotalDurationSeconds(breakSeconds);
+      saveSession('paused', breakSeconds, null);
     } else if (currentMiniTask) {
       const workSeconds = currentMiniTask.durationMinutes * 60;
       setRemainingSeconds(workSeconds);
       setTotalDurationSeconds(workSeconds);
+      saveSession('paused', workSeconds, null);
     }
     setPhase('paused');
-  }, [isBreak, currentMiniTask]);
+  }, [isBreak, currentMiniTask, saveSession]);
 
   // Select a specific mini-task manually
-  const selectMiniTask = useCallback((miniTask: MiniTask) => {
-    targetEndTimeRef.current = null;
-    setIsBreak(false);
-    setCurrentMiniTask(miniTask);
-    const workSeconds = miniTask.durationMinutes * 60;
-    setTotalDurationSeconds(workSeconds);
-    setRemainingSeconds(workSeconds);
-    setPhase('paused');
-  }, []);
+  const selectMiniTask = useCallback(
+    (miniTask: MiniTask) => {
+      targetEndTimeRef.current = null;
+      workStartTimeRef.current = null;
+      setIsBreak(false);
+      setCurrentMiniTask(miniTask);
+      const workSeconds = miniTask.durationMinutes * 60;
+      setTotalDurationSeconds(workSeconds);
+      setRemainingSeconds(workSeconds);
+      setPhase('paused');
+      saveSession('paused', workSeconds, null);
+    },
+    [saveSession]
+  );
 
-  const currentProgressPercent = totalDurationSeconds > 0
-    ? Math.min(100, Math.max(0, ((totalDurationSeconds - remainingSeconds) / totalDurationSeconds) * 100))
-    : 0;
+  const currentProgressPercent =
+    totalDurationSeconds > 0
+      ? Math.min(100, Math.max(0, ((totalDurationSeconds - remainingSeconds) / totalDurationSeconds) * 100))
+      : 0;
 
   return {
     phase,

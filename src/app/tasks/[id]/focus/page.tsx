@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, Suspense } from 'react';
+import React, { useState, useEffect, useCallback, Suspense } from 'react';
 import Link from 'next/link';
 import { useRouter, useParams } from 'next/navigation';
 import { 
@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { MajorTask } from '@/types';
 import { storage } from '@/lib/storage';
+import { taskService } from '@/lib/services/taskService';
 import { useAuth } from '@/lib/authContext';
 import { useTimer } from '@/hooks/useTimer';
 import { CircularTimer } from '@/components/timer/CircularTimer';
@@ -23,32 +24,54 @@ function FocusTimerContent() {
   const router = useRouter();
   const params = useParams();
   const id = (params?.id as string) || '';
+  const currentId = id || '';
   const { user, updatePreferences, isLoading } = useAuth();
-  const userId = user?.id;
+  const currentUserId = user?.id ?? null;
+  const userId = currentUserId || undefined;
 
-  const [prevId, setPrevId] = useState<string>(id);
-  const [prevUserId, setPrevUserId] = useState<string | null>(userId || null);
-
-  const [task, setTask] = useState<MajorTask | null>(() => {
-    if (typeof window !== 'undefined' && id && userId) {
-      return storage.getTaskById(id, userId);
-    }
-    return null;
-  });
+  const [prevId, setPrevId] = useState<string>(currentId);
+  const [prevUserId, setPrevUserId] = useState<string | null>(currentUserId);
+  const [task, setTask] = useState<MajorTask | null>(null);
+  const [isLoadingTask, setIsLoadingTask] = useState<boolean>(true);
 
   // Adjust state during render when id or userId changes
-  if (id !== prevId || userId !== prevUserId) {
-    setPrevId(id);
-    setPrevUserId(userId || null);
-    const loaded = id && userId ? storage.getTaskById(id, userId) : null;
-    setTask(loaded);
+  if (currentId !== prevId || currentUserId !== prevUserId) {
+    setPrevId(currentId);
+    setPrevUserId(currentUserId);
+    setTask(null);
+    setIsLoadingTask(true);
   }
 
-  const refreshTask = () => {
-    if (!id || !userId) return;
-    const fresh = storage.getTaskById(id, userId);
-    setTask(fresh);
-  };
+  const refreshTask = useCallback(async () => {
+    if (!currentId || !currentUserId) return;
+    try {
+      const fresh = await taskService.getTaskById(currentId, currentUserId);
+      setTask(fresh);
+    } catch (e) {
+      console.error('Error refreshing focus task:', e);
+    }
+  }, [currentId, currentUserId]);
+
+  useEffect(() => {
+    let isMounted = true;
+    if (!currentId || !currentUserId) return;
+
+    taskService.getTaskById(currentId, currentUserId)
+      .then(fresh => {
+        if (isMounted) {
+          setTask(fresh);
+          setIsLoadingTask(false);
+        }
+      })
+      .catch(err => {
+        console.error('Error loading task for focus:', err);
+        if (isMounted) setIsLoadingTask(false);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [currentId, currentUserId]);
 
   const [showExitConfirm, setShowExitConfirm] = useState(false);
   const [showSummaryModal, setShowSummaryModal] = useState(false);
@@ -59,18 +82,22 @@ function FocusTimerContent() {
 
   const soundEnabled = user?.preferences?.soundEnabled ?? true;
 
+  const handleMiniTaskCompleted = useCallback(() => {
+    refreshTask();
+  }, [refreshTask]);
+
+  const handleAllCompleted = useCallback((stats: { completedCount: number; focusedMinutes: number }) => {
+    refreshTask();
+    setCompletedStats(stats);
+    setShowSummaryModal(true);
+  }, [refreshTask]);
+
   const timer = useTimer({
     majorTask: task,
-    userId: user?.id,
+    userId: currentUserId || undefined,
     soundEnabled,
-    onMiniTaskCompleted: () => {
-      refreshTask();
-    },
-    onAllCompleted: (stats) => {
-      refreshTask();
-      setCompletedStats(stats);
-      setShowSummaryModal(true);
-    },
+    onMiniTaskCompleted: handleMiniTaskCompleted,
+    onAllCompleted: handleAllCompleted,
   });
 
   // Keyboard navigation: Space = Pause/Resume, Shift+C = Complete
@@ -97,7 +124,7 @@ function FocusTimerContent() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [timer]);
 
-  if (isLoading) {
+  if (isLoading || isLoadingTask) {
     return (
       <div className="min-h-screen bg-[var(--bg-app,#091311)] flex items-center justify-center">
         <div className="w-8 h-8 rounded-full border-2 border-[var(--primary-accent,#5ACB91)] border-t-transparent animate-spin" />
@@ -148,12 +175,14 @@ function FocusTimerContent() {
     }
   };
 
-  const handleRestartSequence = () => {
-    // Unmark mini tasks to restart sequence fresh
-    miniTasks.forEach(m => {
-      storage.updateMiniTask(task.id, m.id, { isCompleted: false }, user?.id);
-    });
-    refreshTask();
+  const handleRestartSequence = async () => {
+    if (!task || !userId) return;
+    storage.clearTimerSession(task.id, userId);
+    for (const m of miniTasks) {
+      await taskService.updateMiniTask(task.id, m.id, { isCompleted: false }, userId);
+    }
+    await taskService.updateMajorTask(task.id, { status: 'in_progress' }, userId);
+    await refreshTask();
     if (miniTasks[0]) {
       timer.selectMiniTask(miniTasks[0]);
     }

@@ -16,13 +16,35 @@ import {
   prepareMiniTaskCompletionUpdates,
 } from '@/lib/supabase/mappers';
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidUuid(id?: string | null): boolean {
+  return typeof id === 'string' && UUID_REGEX.test(id);
+}
+
 /**
  * TaskService manages asynchronous Supabase CRUD operations for Major Tasks and Mini Tasks,
  * while safely preserving legacy LocalStorage behavior for mock identity 'usr_mock_001'.
  */
 class TaskService {
   private isMockUser(userId?: string): boolean {
-    return !userId || userId === 'usr_mock_001';
+    return !userId || userId === 'usr_mock_001' || !isValidUuid(userId);
+  }
+
+  /**
+   * Helper that retrieves the Supabase browser client and ensures the auth
+   * session is resolved so that the Authorization: Bearer <jwt> header is attached.
+   */
+  private async getClient() {
+    const supabase = getBrowserClient();
+    if (typeof window !== 'undefined') {
+      try {
+        await supabase.auth.getSession();
+      } catch (err) {
+        console.warn('TaskService: Session check warning:', err);
+      }
+    }
+    return supabase;
   }
 
   private emitSync(): void {
@@ -43,8 +65,23 @@ class TaskService {
       return storage.getTasks(userId);
     }
 
-    const supabase = getBrowserClient();
-    const { data, error } = await supabase
+    const supabase = await this.getClient();
+
+    // Temporary Safe Diagnostic Logging (Zero secrets printed)
+    const { data: { session }, error: sessionErr } = await supabase.auth.getSession();
+    console.log('[TaskService Auth Diagnostic]', {
+      hasSession: Boolean(session),
+      sessionUserId: session?.user?.id ?? 'none',
+      requestedUserId: userId,
+      userIdsMatch: session?.user?.id === userId,
+      userRole: session?.user?.role ?? 'none',
+      hasAccessToken: Boolean(session?.access_token),
+      tokenLength: session?.access_token ? session.access_token.length : 0,
+      isTokenExpired: session?.expires_at ? (session.expires_at * 1000 < Date.now()) : 'N/A',
+      sessionError: sessionErr?.message ?? 'none',
+    });
+
+    const { data, error, status, statusText } = await supabase
       .from('major_tasks')
       .select('*, mini_tasks(*)')
       .eq('user_id', userId)
@@ -52,7 +89,15 @@ class TaskService {
       .order('created_at', { ascending: false });
 
     if (error) {
-      console.error('TaskService.getTasks error:', error.message);
+      console.error('TaskService.getTasks error:', error);
+      console.error('TaskService.getTasks error details:', {
+        status,
+        statusText,
+        message: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+      });
       return [];
     }
 
@@ -63,12 +108,12 @@ class TaskService {
    * Retrieves a single major task by ID for the specified user, including nested mini-tasks.
    */
   async getTaskById(id: string, userId: string): Promise<MajorTask | null> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !isValidUuid(id)) {
       return storage.getTaskById(id, userId);
     }
 
-    const supabase = getBrowserClient();
-    const { data, error } = await supabase
+    const supabase = await this.getClient();
+    const { data, error, status, statusText } = await supabase
       .from('major_tasks')
       .select('*, mini_tasks(*)')
       .eq('id', id)
@@ -76,7 +121,19 @@ class TaskService {
       .maybeSingle();
 
     if (error || !data) {
-      if (error) console.error('TaskService.getTaskById error:', error.message);
+      if (error) {
+        console.error('TaskService.getTaskById error:', error);
+        console.error('TaskService.getTaskById error details:', {
+          status,
+          statusText,
+          message: error.message,
+          code: error.code,
+          details: error.details,
+          hint: error.hint,
+          id,
+          userId,
+        });
+      }
       return null;
     }
 
@@ -98,7 +155,7 @@ class TaskService {
       return task;
     }
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
     const payload = prepareMajorTaskInsert(title, description, userId);
 
     const { data, error } = await supabase
@@ -132,7 +189,7 @@ class TaskService {
       return current;
     }
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
     const updates = prepareMajorTaskStatusUpdates('in_progress', current.startedAt, current.createdAt);
 
     const { data, error } = await supabase
@@ -170,7 +227,7 @@ class TaskService {
     const current = await this.getTaskById(id, userId);
     if (!current) return null;
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
     const dbUpdates: Record<string, unknown> = {};
 
     if (updates.title !== undefined) dbUpdates.title = updates.title.trim();
@@ -224,7 +281,7 @@ class TaskService {
     const current = await this.getTaskById(id, userId);
     if (!current) return null;
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
     const now = new Date().toISOString();
 
     // 1. Mark all incomplete mini-tasks as completed
@@ -270,7 +327,10 @@ class TaskService {
     }
 
     const original = await this.getTaskById(completedTaskId, userId);
-    if (!original) return null;
+    if (!original) {
+      console.warn(`TaskService.reuseTask: Original task "${completedTaskId}" not found for user "${userId}".`);
+      return null;
+    }
 
     // 1. Create new major task
     const newTask = await this.createMajorTask(original.title, original.description, userId);
@@ -308,7 +368,7 @@ class TaskService {
       return res;
     }
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
     const { error } = await supabase
       .from('major_tasks')
       .delete()
@@ -350,7 +410,7 @@ class TaskService {
       return created;
     }
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
 
     // Query existing mini-tasks count for order_index calculation
     const { count } = await supabase
@@ -392,7 +452,7 @@ class TaskService {
       return updated;
     }
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
     const dbUpdates: Record<string, unknown> = {};
 
     if (updates.title !== undefined) dbUpdates.title = updates.title.trim();
@@ -461,7 +521,7 @@ class TaskService {
       return res;
     }
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
 
     const { error } = await supabase
       .from('mini_tasks')
@@ -514,7 +574,7 @@ class TaskService {
       return;
     }
 
-    const supabase = getBrowserClient();
+    const supabase = await this.getClient();
 
     // Update order_index sequentially for each task in reordered order
     await Promise.all(
@@ -533,3 +593,4 @@ class TaskService {
 }
 
 export const taskService = new TaskService();
+
