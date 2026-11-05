@@ -29,7 +29,7 @@ import {
 } from 'lucide-react';
 
 function DashboardContent() {
-  const { user } = useAuth();
+  const { user, isAuthenticated, isLoading } = useAuth();
   const searchParams = useSearchParams();
   
   // Navigation view: 'dashboard' | 'my-tasks' | 'completed'
@@ -44,6 +44,9 @@ function DashboardContent() {
 
   const currentUserId = user?.id ?? null;
   const userId = currentUserId || undefined;
+  const isMockUser = !currentUserId || currentUserId === 'usr_mock_001';
+  const canQueryTasks = !isLoading && (isAuthenticated || isMockUser);
+
   const [prevUserId, setPrevUserId] = useState<string | null>(currentUserId);
   const [tasks, setTasks] = useState<MajorTask[]>([]);
 
@@ -59,19 +62,19 @@ function DashboardContent() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const reloadTasks = useCallback(async () => {
-    if (currentUserId) {
-      const fresh = await taskService.getTasks(currentUserId);
-      setTasks(fresh);
-    } else {
-      setTasks([]);
+    if (!canQueryTasks || !currentUserId) {
+      return;
     }
-  }, [currentUserId]);
+    const fresh = await taskService.getTasks(currentUserId);
+    setTasks(fresh);
+  }, [canQueryTasks, currentUserId]);
 
   // Immediate reactive synchronization across tabs, routes, and focus sessions
   useEffect(() => {
     let isMounted = true;
 
-    if (!currentUserId) return;
+    // Guard: Wait until auth has completed loading before triggering database queries
+    if (!canQueryTasks || !currentUserId) return;
 
     taskService.getTasks(currentUserId)
       .then(fresh => {
@@ -82,7 +85,8 @@ function DashboardContent() {
       });
 
     const handleSync = async () => {
-      if (!currentUserId) return;
+      // Guard: Avoid premature background requests during auth transitions
+      if (!canQueryTasks || !currentUserId) return;
       try {
         const fresh = await taskService.getTasks(currentUserId);
         if (isMounted) {
@@ -102,7 +106,7 @@ function DashboardContent() {
       window.removeEventListener('storage', handleSync);
       window.removeEventListener('focus', handleSync);
     };
-  }, [currentUserId]);
+  }, [canQueryTasks, currentUserId]);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);

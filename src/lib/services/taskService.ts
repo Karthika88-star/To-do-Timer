@@ -27,6 +27,10 @@ function isValidUuid(id?: string | null): boolean {
  * while safely preserving legacy LocalStorage behavior for mock identity 'usr_mock_001'.
  */
 class TaskService {
+  private isValidUuid(id?: string | null): boolean {
+    return isValidUuid(id);
+  }
+
   private isMockUser(userId?: string): boolean {
     return !userId || userId === 'usr_mock_001' || !isValidUuid(userId);
   }
@@ -47,6 +51,31 @@ class TaskService {
     return supabase;
   }
 
+  /**
+   * Helper that retrieves a valid authenticated Supabase session matching userId.
+   * Proactively refreshes expired tokens. Returns null if unauthenticated or mismatched.
+   */
+  private async getValidSession(userId: string) {
+    if (this.isMockUser(userId)) return null;
+    const supabase = await this.getClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    let activeSession = session;
+    if (activeSession?.expires_at && activeSession.expires_at * 1000 < Date.now()) {
+      try {
+        const { data: refreshed, error: refreshErr } = await supabase.auth.refreshSession();
+        if (!refreshErr && refreshed.session) {
+          activeSession = refreshed.session;
+        }
+      } catch (err) {
+        console.warn('TaskService: Session refresh check warning:', err);
+      }
+    }
+    if (!activeSession || !activeSession.access_token || activeSession.user.id !== userId) {
+      return null;
+    }
+    return activeSession;
+  }
+
   private emitSync(): void {
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('todo_timer_tasks_updated'));
@@ -65,22 +94,13 @@ class TaskService {
       return storage.getTasks(userId);
     }
 
+    const session = await this.getValidSession(userId);
+    if (!session) {
+      console.warn('TaskService.getTasks: No valid authenticated Supabase session matching userId. Preserving local workspace data.');
+      return storage.getTasks(userId);
+    }
+
     const supabase = await this.getClient();
-
-    // Temporary Safe Diagnostic Logging (Zero secrets printed)
-    const { data: { session }, error: sessionErr } = await supabase.auth.getSession();
-    console.log('[TaskService Auth Diagnostic]', {
-      hasSession: Boolean(session),
-      sessionUserId: session?.user?.id ?? 'none',
-      requestedUserId: userId,
-      userIdsMatch: session?.user?.id === userId,
-      userRole: session?.user?.role ?? 'none',
-      hasAccessToken: Boolean(session?.access_token),
-      tokenLength: session?.access_token ? session.access_token.length : 0,
-      isTokenExpired: session?.expires_at ? (session.expires_at * 1000 < Date.now()) : 'N/A',
-      sessionError: sessionErr?.message ?? 'none',
-    });
-
     const { data, error, status, statusText } = await supabase
       .from('major_tasks')
       .select('*, mini_tasks(*)')
@@ -91,14 +111,15 @@ class TaskService {
     if (error) {
       console.error('TaskService.getTasks error:', error);
       console.error('TaskService.getTasks error details:', {
-        status,
-        statusText,
-        message: error.message,
-        code: error.code,
-        details: error.details,
-        hint: error.hint,
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || (typeof error === 'string' ? error : 'Unknown error'),
+        errorCode: error?.code || 'NO_CODE',
+        errorHint: error?.hint || 'None',
+        errorDetails: error?.details || 'None',
       });
-      return [];
+      // Fallback to local workspace so tasks are preserved on transient database error
+      return storage.getTasks(userId);
     }
 
     return toMajorTaskList((data as MajorTaskWithMiniTasksRow[]) || []);
@@ -109,6 +130,11 @@ class TaskService {
    */
   async getTaskById(id: string, userId: string): Promise<MajorTask | null> {
     if (this.isMockUser(userId) || !isValidUuid(id)) {
+      return storage.getTaskById(id, userId);
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
       return storage.getTaskById(id, userId);
     }
 
@@ -124,17 +150,17 @@ class TaskService {
       if (error) {
         console.error('TaskService.getTaskById error:', error);
         console.error('TaskService.getTaskById error details:', {
-          status,
-          statusText,
-          message: error.message,
-          code: error.code,
-          details: error.details,
-          hint: error.hint,
+          httpStatus: status ?? 'N/A',
+          statusText: statusText ?? 'N/A',
+          errorMessage: error?.message || (typeof error === 'string' ? error : 'Unknown error'),
+          errorCode: error?.code || 'NO_CODE',
+          errorHint: error?.hint || 'None',
+          errorDetails: error?.details || 'None',
           id,
           userId,
         });
       }
-      return null;
+      return storage.getTaskById(id, userId);
     }
 
     const row = data as MajorTaskWithMiniTasksRow;
@@ -155,18 +181,34 @@ class TaskService {
       return task;
     }
 
+    const session = await this.getValidSession(userId);
+    if (!session) {
+      console.warn('TaskService.createMajorTask: No active Supabase session. Storing in local workspace.');
+      const task = storage.createMajorTask(title, description, userId);
+      this.emitSync();
+      return task;
+    }
+
     const supabase = await this.getClient();
     const payload = prepareMajorTaskInsert(title, description, userId);
 
-    const { data, error } = await supabase
+    const { data, error, status, statusText } = await supabase
       .from('major_tasks')
       .insert(payload)
       .select('*, mini_tasks(*)')
       .single();
 
     if (error || !data) {
-      console.error('TaskService.createMajorTask error:', error?.message);
-      return null;
+      console.error('TaskService.createMajorTask error:', error);
+      console.error('TaskService.createMajorTask error details:', {
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || 'Unknown error',
+        errorCode: error?.code || 'NO_CODE',
+      });
+      const task = storage.createMajorTask(title, description, userId);
+      this.emitSync();
+      return task;
     }
 
     const created = toMajorTask(data as MajorTaskRow, []);
@@ -178,7 +220,14 @@ class TaskService {
    * Starts a major task, moving its status to 'in_progress' and setting started_at.
    */
   async startMajorTask(id: string, userId: string): Promise<MajorTask | null> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !isValidUuid(id)) {
+      const updated = storage.startMajorTask(id, userId);
+      this.emitSync();
+      return updated;
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
       const updated = storage.startMajorTask(id, userId);
       this.emitSync();
       return updated;
@@ -192,7 +241,7 @@ class TaskService {
     const supabase = await this.getClient();
     const updates = prepareMajorTaskStatusUpdates('in_progress', current.startedAt, current.createdAt);
 
-    const { data, error } = await supabase
+    const { data, error, status, statusText } = await supabase
       .from('major_tasks')
       .update(updates)
       .eq('id', id)
@@ -201,8 +250,14 @@ class TaskService {
       .single();
 
     if (error || !data) {
-      console.error('TaskService.startMajorTask error:', error?.message);
-      return null;
+      console.error('TaskService.startMajorTask error:', error);
+      console.error('TaskService.startMajorTask error details:', {
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || 'Unknown error',
+        errorCode: error?.code || 'NO_CODE',
+      });
+      return storage.startMajorTask(id, userId);
     }
 
     const updated = toMajorTask(data as MajorTaskWithMiniTasksRow, (data as MajorTaskWithMiniTasksRow).mini_tasks || []);
@@ -218,7 +273,14 @@ class TaskService {
     updates: Partial<Pick<MajorTask, 'title' | 'description' | 'status' | 'startedAt' | 'isArchived' | 'isCompleted' | 'completedAt'>>,
     userId: string
   ): Promise<MajorTask | null> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !isValidUuid(id)) {
+      const updated = storage.updateMajorTask(id, updates, userId);
+      this.emitSync();
+      return updated;
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
       const updated = storage.updateMajorTask(id, updates, userId);
       this.emitSync();
       return updated;
@@ -250,7 +312,7 @@ class TaskService {
       }
     }
 
-    const { data, error } = await supabase
+    const { data, error, status, statusText } = await supabase
       .from('major_tasks')
       .update(dbUpdates)
       .eq('id', id)
@@ -259,8 +321,14 @@ class TaskService {
       .single();
 
     if (error || !data) {
-      console.error('TaskService.updateMajorTask error:', error?.message);
-      return null;
+      console.error('TaskService.updateMajorTask error:', error);
+      console.error('TaskService.updateMajorTask error details:', {
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || 'Unknown error',
+        errorCode: error?.code || 'NO_CODE',
+      });
+      return storage.updateMajorTask(id, updates, userId);
     }
 
     const updated = toMajorTask(data as MajorTaskWithMiniTasksRow, (data as MajorTaskWithMiniTasksRow).mini_tasks || []);
@@ -272,7 +340,14 @@ class TaskService {
    * Completes a major task and all its mini-tasks, clearing active timer sessions.
    */
   async completeMajorTask(id: string, userId: string): Promise<MajorTask | null> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !isValidUuid(id)) {
+      const completed = storage.completeMajorTask(id, userId);
+      this.emitSync();
+      return completed;
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
       const completed = storage.completeMajorTask(id, userId);
       this.emitSync();
       return completed;
@@ -295,7 +370,7 @@ class TaskService {
     // 2. Mark major task completed with required non-null started_at and completed_at
     const statusUpdates = prepareMajorTaskStatusUpdates('completed', current.startedAt, current.createdAt);
 
-    const { data, error } = await supabase
+    const { data, error, status, statusText } = await supabase
       .from('major_tasks')
       .update(statusUpdates)
       .eq('id', id)
@@ -307,8 +382,14 @@ class TaskService {
     storage.clearTimerSession(id, userId);
 
     if (error || !data) {
-      console.error('TaskService.completeMajorTask error:', error?.message);
-      return null;
+      console.error('TaskService.completeMajorTask error:', error);
+      console.error('TaskService.completeMajorTask error details:', {
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || 'Unknown error',
+        errorCode: error?.code || 'NO_CODE',
+      });
+      return storage.completeMajorTask(id, userId);
     }
 
     const completed = toMajorTask(data as MajorTaskWithMiniTasksRow, (data as MajorTaskWithMiniTasksRow).mini_tasks || []);
@@ -362,14 +443,24 @@ class TaskService {
    * Deletes a major task. PostgreSQL foreign keys cascade deletion to mini_tasks and timer_sessions.
    */
   async deleteMajorTask(id: string, userId: string): Promise<boolean> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !this.isValidUuid(id)) {
       const res = storage.deleteMajorTask(id, userId);
+      storage.clearTimerSession(id, userId);
+      this.emitSync();
+      return res;
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
+      console.warn(`TaskService.deleteMajorTask: No valid authenticated session for user "${userId}". Deleting from local storage fallback.`);
+      const res = storage.deleteMajorTask(id, userId);
+      storage.clearTimerSession(id, userId);
       this.emitSync();
       return res;
     }
 
     const supabase = await this.getClient();
-    const { error } = await supabase
+    const { error, status, statusText } = await supabase
       .from('major_tasks')
       .delete()
       .eq('id', id)
@@ -378,8 +469,14 @@ class TaskService {
     storage.clearTimerSession(id, userId);
 
     if (error) {
-      console.error('TaskService.deleteMajorTask error:', error.message);
-      return false;
+      console.error('TaskService.deleteMajorTask error:', error);
+      console.error('TaskService.deleteMajorTask error details:', {
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || 'Unknown error',
+        errorCode: error?.code || 'NO_CODE',
+      });
+      return storage.deleteMajorTask(id, userId);
     }
 
     this.emitSync();
@@ -404,7 +501,15 @@ class TaskService {
     },
     userId: string
   ): Promise<MiniTask | null> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !this.isValidUuid(majorTaskId)) {
+      const created = storage.addMiniTask(majorTaskId, miniTaskData, userId);
+      this.emitSync();
+      return created;
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
+      console.warn(`TaskService.addMiniTask: No valid authenticated session for user "${userId}". Adding to local storage fallback.`);
       const created = storage.addMiniTask(majorTaskId, miniTaskData, userId);
       this.emitSync();
       return created;
@@ -422,15 +527,23 @@ class TaskService {
     const nextOrder = (count || 0) + 1;
     const payload = prepareMiniTaskInsert(majorTaskId, userId, miniTaskData, nextOrder);
 
-    const { data, error } = await supabase
+    const { data, error, status, statusText } = await supabase
       .from('mini_tasks')
       .insert(payload)
       .select('*')
       .single();
 
     if (error || !data) {
-      console.error('TaskService.addMiniTask error:', error?.message);
-      return null;
+      console.error('TaskService.addMiniTask error:', error);
+      console.error('TaskService.addMiniTask error details:', {
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || 'Unknown error',
+        errorCode: error?.code || 'NO_CODE',
+      });
+      const created = storage.addMiniTask(majorTaskId, miniTaskData, userId);
+      this.emitSync();
+      return created;
     }
 
     this.emitSync();
@@ -446,7 +559,15 @@ class TaskService {
     updates: Partial<MiniTask>,
     userId: string
   ): Promise<MiniTask | null> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !this.isValidUuid(majorTaskId) || !this.isValidUuid(miniTaskId)) {
+      const updated = storage.updateMiniTask(majorTaskId, miniTaskId, updates, userId);
+      this.emitSync();
+      return updated;
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
+      console.warn(`TaskService.updateMiniTask: No valid authenticated session for user "${userId}". Updating local storage fallback.`);
       const updated = storage.updateMiniTask(majorTaskId, miniTaskId, updates, userId);
       this.emitSync();
       return updated;
@@ -474,7 +595,7 @@ class TaskService {
       }
     }
 
-    const { data, error } = await supabase
+    const { data, error, status, statusText } = await supabase
       .from('mini_tasks')
       .update(dbUpdates)
       .eq('id', miniTaskId)
@@ -484,8 +605,16 @@ class TaskService {
       .single();
 
     if (error || !data) {
-      console.error('TaskService.updateMiniTask error:', error?.message);
-      return null;
+      console.error('TaskService.updateMiniTask error:', error);
+      console.error('TaskService.updateMiniTask error details:', {
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || 'Unknown error',
+        errorCode: error?.code || 'NO_CODE',
+      });
+      const updated = storage.updateMiniTask(majorTaskId, miniTaskId, updates, userId);
+      this.emitSync();
+      return updated;
     }
 
     // Recalculate parent major task completion / progress status
@@ -515,7 +644,15 @@ class TaskService {
     miniTaskId: string,
     userId: string
   ): Promise<boolean> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !this.isValidUuid(majorTaskId) || !this.isValidUuid(miniTaskId)) {
+      const res = storage.deleteMiniTask(majorTaskId, miniTaskId, userId);
+      this.emitSync();
+      return res;
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
+      console.warn(`TaskService.deleteMiniTask: No valid authenticated session for user "${userId}". Deleting from local storage fallback.`);
       const res = storage.deleteMiniTask(majorTaskId, miniTaskId, userId);
       this.emitSync();
       return res;
@@ -523,7 +660,7 @@ class TaskService {
 
     const supabase = await this.getClient();
 
-    const { error } = await supabase
+    const { error, status, statusText } = await supabase
       .from('mini_tasks')
       .delete()
       .eq('id', miniTaskId)
@@ -531,8 +668,16 @@ class TaskService {
       .eq('user_id', userId);
 
     if (error) {
-      console.error('TaskService.deleteMiniTask error:', error.message);
-      return false;
+      console.error('TaskService.deleteMiniTask error:', error);
+      console.error('TaskService.deleteMiniTask error details:', {
+        httpStatus: status ?? 'N/A',
+        statusText: statusText ?? 'N/A',
+        errorMessage: error?.message || 'Unknown error',
+        errorCode: error?.code || 'NO_CODE',
+      });
+      const res = storage.deleteMiniTask(majorTaskId, miniTaskId, userId);
+      this.emitSync();
+      return res;
     }
 
     // Re-index remaining mini-tasks
@@ -568,7 +713,15 @@ class TaskService {
     reorderedMiniTasks: MiniTask[],
     userId: string
   ): Promise<void> {
-    if (this.isMockUser(userId)) {
+    if (this.isMockUser(userId) || !this.isValidUuid(majorTaskId)) {
+      storage.reorderMiniTasks(majorTaskId, reorderedMiniTasks, userId);
+      this.emitSync();
+      return;
+    }
+
+    const session = await this.getValidSession(userId);
+    if (!session) {
+      console.warn(`TaskService.reorderMiniTasks: No valid authenticated session for user "${userId}". Reordering in local storage fallback.`);
       storage.reorderMiniTasks(majorTaskId, reorderedMiniTasks, userId);
       this.emitSync();
       return;
